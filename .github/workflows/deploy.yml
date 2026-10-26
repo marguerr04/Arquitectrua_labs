@@ -1,0 +1,91 @@
+name: Deploy (AWS SAM)
+
+# Se ejecuta solo cuando llega código a main
+on:
+  push:
+    branches: ["main"]
+  workflow_dispatch: # permite lanzarlo a mano desde la pestaña Actions
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: backend
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: backend/package-lock.json
+
+      - run: npm ci
+      - run: npm test
+
+  deploy:
+    needs: test # solo despliega si los tests pasan
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Descargar código
+        uses: actions/checkout@v4
+
+      - name: Instalar Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Instalar AWS SAM CLI
+        uses: aws-actions/setup-sam@v2
+        with:
+          use-installer: true
+
+      - name: Configurar credenciales AWS (Learner Lab)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-session-token: ${{ secrets.AWS_SESSION_TOKEN }}
+          aws-region: us-east-1
+
+      - name: Validar template
+        run: sam validate --lint
+
+      - name: Build
+        run: sam build
+
+      - name: Deploy backend
+        run: |
+          # Usa el LabRole de TU cuenta (no la del profesor)
+          ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
+          sam deploy \
+            --no-confirm-changeset \
+            --no-fail-on-empty-changeset \
+            --parameter-overrides AppVersion="${GITHUB_SHA::7}" LambdaExecutionRoleArn="arn:aws:iam::${ACCOUNT_ID}:role/LabRole"
+
+      - name: Leer outputs del stack
+        id: outputs
+        run: |
+          STACK=sam-demo-meteo
+          get() {
+            aws cloudformation describe-stacks --stack-name "$STACK" \
+              --query "Stacks[0].Outputs[?OutputKey=='$1'].OutputValue" --output text
+          }
+          echo "api_url=$(get ApiUrl)" >> "$GITHUB_OUTPUT"
+          echo "bucket=$(get FrontendBucketName)" >> "$GITHUB_OUTPUT"
+          echo "site=$(get FrontendWebsiteUrl)" >> "$GITHUB_OUTPUT"
+
+      - name: Apuntar el frontend a la API desplegada
+        run: |
+          sed -i "s#https://[a-z0-9]*\.execute-api\.[a-z0-9-]*\.amazonaws\.com/api#${{ steps.outputs.outputs.api_url }}/api#" frontend/app.js
+          grep -n "execute-api" frontend/app.js
+
+      - name: Subir frontend a S3
+        run: aws s3 sync frontend/ "s3://${{ steps.outputs.outputs.bucket }}" --delete
+
+      - name: Mostrar URLs
+        run: |
+          echo "API:      ${{ steps.outputs.outputs.api_url }}/api/health"
+          echo "Frontend: ${{ steps.outputs.outputs.site }}"
